@@ -243,6 +243,12 @@ func (r *backupStorageLocationReconciler) Reconcile(ctx context.Context, req ctr
 			return
 		}
 
+		if location.Spec.ObjectStorage != nil &&
+			location.Spec.ObjectStorage.EncryptionPublicKeyRef != nil &&
+			location.Spec.ObjectStorage.EncryptionPrivateKeyRef == nil {
+			log.Warn("BSL has encryption enabled but no private key configured — restores will require providing encryptionPrivateKeyRef via the Restore spec or CLI flag")
+		}
+
 		backupStore, err := r.backupStoreGetter.Get(&location, pluginManager, log)
 		if err != nil {
 			log.WithError(err).Error("Error getting a backup store")

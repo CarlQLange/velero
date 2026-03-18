@@ -19,6 +19,7 @@ package restore
 import (
 	"context"
 	"fmt"
+	"os"
 	"sort"
 	"time"
 
@@ -102,6 +103,7 @@ type CreateOptions struct {
 	ResourceModifierConfigMap string
 	WriteSparseFiles          flag.OptionalBool
 	ParallelFilesDownload     int
+	EncryptionPrivateKeyFile  string
 	client                    kbclient.WithWatch
 }
 
@@ -158,6 +160,8 @@ func (o *CreateOptions) BindFlags(flags *pflag.FlagSet) {
 	f.NoOptDefVal = cmd.TRUE
 
 	flags.IntVar(&o.ParallelFilesDownload, "parallel-files-download", 0, "The number of restore operations to run in parallel. If set to 0, the default parallelism will be the number of CPUs for the node that node agent pod is running.")
+
+	flags.StringVar(&o.EncryptionPrivateKeyFile, "encryption-private-key", "", "Path to an age private key file for decrypting an encrypted backup.")
 }
 
 func (o *CreateOptions) Complete(args []string, f client.Factory) error {
@@ -349,6 +353,39 @@ func (o *CreateOptions) Run(c *cobra.Command, f client.Factory) error {
 		}
 	}
 
+	// If an encryption private key file was provided, create a temporary Secret
+	// containing the key and set EncryptionPrivateKeyRef on the restore spec.
+	if o.EncryptionPrivateKeyFile != "" {
+		keyData, err := os.ReadFile(o.EncryptionPrivateKeyFile)
+		if err != nil {
+			return errors.Wrap(err, "error reading encryption private key file")
+		}
+
+		secretName := fmt.Sprintf("velero-restore-enc-%s", o.RestoreName)
+		encSecret := &corev1api.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: f.Namespace(),
+				Name:      secretName,
+			},
+			Data: map[string][]byte{
+				"key": keyData,
+			},
+		}
+
+		if err := o.client.Create(context.TODO(), encSecret, &kbclient.CreateOptions{}); err != nil {
+			return errors.Wrap(err, "error creating encryption key secret")
+		}
+
+		restore.Spec.EncryptionPrivateKeyRef = &corev1api.SecretKeySelector{
+			LocalObjectReference: corev1api.LocalObjectReference{
+				Name: secretName,
+			},
+			Key: "key",
+		}
+
+		fmt.Printf("Created temporary encryption key secret %q\n", secretName)
+	}
+
 	if printed, err := output.PrintWithFormat(c, restore); printed || err != nil {
 		return err
 	}
@@ -400,6 +437,28 @@ func (o *CreateOptions) Run(c *cobra.Command, f client.Factory) error {
 	err := o.client.Create(context.TODO(), restore, &kbclient.CreateOptions{})
 	if err != nil {
 		return err
+	}
+
+	// Set owner reference on the temp encryption Secret so it's garbage collected
+	// when the Restore CR is deleted.
+	if o.EncryptionPrivateKeyFile != "" {
+		secretName := fmt.Sprintf("velero-restore-enc-%s", o.RestoreName)
+		encSecret := &corev1api.Secret{}
+		if err := o.client.Get(context.TODO(), kbclient.ObjectKey{Namespace: f.Namespace(), Name: secretName}, encSecret); err == nil {
+			isController := true
+			encSecret.OwnerReferences = []metav1.OwnerReference{
+				{
+					APIVersion: api.SchemeGroupVersion.String(),
+					Kind:       "Restore",
+					Name:       restore.Name,
+					UID:        restore.UID,
+					Controller: &isController,
+				},
+			}
+			if err := o.client.Update(context.TODO(), encSecret, &kbclient.UpdateOptions{}); err != nil {
+				fmt.Printf("Warning: could not set owner reference on encryption key secret: %v\n", err)
+			}
+		}
 	}
 
 	fmt.Printf("Restore request %q submitted successfully.\n", restore.Name)

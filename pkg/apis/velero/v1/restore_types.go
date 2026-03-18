@@ -129,6 +129,12 @@ type RestoreSpec struct {
 	// +optional
 	// +nullable
 	UploaderConfig *UploaderConfigForRestore `json:"uploaderConfig,omitempty"`
+
+	// EncryptionPrivateKeyRef is a reference to a Secret containing an age X25519
+	// private key for decrypting an encrypted backup. If set, this overrides the
+	// BSL's encryptionPrivateKeyRef for this restore operation.
+	// +optional
+	EncryptionPrivateKeyRef *corev1api.SecretKeySelector `json:"encryptionPrivateKeyRef,omitempty"`
 }
 
 // UploaderConfigForRestore defines the configuration for the restore.

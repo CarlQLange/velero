@@ -47,6 +47,28 @@ func TestMostRecentBackup(t *testing.T) {
 	require.Equal(t, expectedBackup.Name, resultBackup.Name)
 }
 
+func TestEncryptionPrivateKeyFlag(t *testing.T) {
+	t.Run("flag is accepted and sets EncryptionPrivateKeyFile", func(t *testing.T) {
+		flags := new(pflag.FlagSet)
+		o := NewCreateOptions()
+		o.BindFlags(flags)
+
+		flags.Parse([]string{"--from-backup", "backup-1", "--encryption-private-key", "/tmp/age-key.txt"})
+
+		require.Equal(t, "/tmp/age-key.txt", o.EncryptionPrivateKeyFile)
+	})
+
+	t.Run("flag is optional and defaults to empty", func(t *testing.T) {
+		flags := new(pflag.FlagSet)
+		o := NewCreateOptions()
+		o.BindFlags(flags)
+
+		flags.Parse([]string{"--from-backup", "backup-1"})
+
+		require.Equal(t, "", o.EncryptionPrivateKeyFile)
+	})
+}
+
 func TestCreateCommand(t *testing.T) {
 	name := "nameToBeCreated"
 	args := []string{name}

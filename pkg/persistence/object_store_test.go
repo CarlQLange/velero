@@ -27,6 +27,7 @@ import (
 	"strings"
 	"testing"
 
+	"filippo.io/age"
 	snapshotv1api "github.com/kubernetes-csi/external-snapshotter/client/v8/apis/volumesnapshot/v1"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -1284,4 +1285,215 @@ type errorReader struct{}
 
 func (r *errorReader) Read([]byte) (int, error) {
 	return 0, errors.New("error readers return errors")
+}
+
+// newObjectBackupStoreTestHarnessWithEncryption creates a test harness with
+// age encryption configured, simulating a BSL with encryptionPublicKeyRef
+// and optionally encryptionPrivateKeyRef.
+func newObjectBackupStoreTestHarnessWithEncryption(
+	bucket, prefix string,
+	recipients []age.Recipient,
+	identities []age.Identity,
+) *objectBackupStoreTestHarness {
+	objectStore := newInMemoryObjectStore(bucket)
+
+	return &objectBackupStoreTestHarness{
+		objectBackupStore: &objectBackupStore{
+			objectStore:          objectStore,
+			bucket:               bucket,
+			layout:               NewObjectStoreLayout(prefix),
+			logger:               velerotest.NewLogger(),
+			encryptionRecipients: recipients,
+			encryptionIdentities: identities,
+		},
+		objectStore: objectStore,
+		bucket:      bucket,
+		prefix:      prefix,
+	}
+}
+
+func TestPutGetBackupContentsWithEncryption(t *testing.T) {
+	id, err := age.GenerateX25519Identity()
+	require.NoError(t, err)
+
+	harness := newObjectBackupStoreTestHarnessWithEncryption(
+		"test-bucket", "",
+		[]age.Recipient{id.Recipient()},
+		[]age.Identity{id},
+	)
+	plaintext := "this is the backup tarball contents"
+
+	require.NoError(t, harness.PutBackupContents("backup-1", newStringReadSeeker(plaintext)))
+
+	// The raw bytes stored in the object store must not equal the plaintext.
+	rawKey := harness.layout.getBackupContentsKey("backup-1")
+	rawReader, err := harness.objectStore.GetObject(harness.bucket, rawKey)
+	require.NoError(t, err)
+	rawBytes, err := io.ReadAll(rawReader)
+	require.NoError(t, err)
+	assert.NotEqual(t, []byte(plaintext), rawBytes, "stored bytes should be encrypted, not plaintext")
+	assert.True(t,
+		len(rawBytes) > len(encryptionMagic) && string(rawBytes[:len(encryptionMagic)]) == encryptionMagic,
+		"stored bytes should start with age header",
+	)
+
+	// Reading back through the store should transparently decrypt.
+	rc, err := harness.GetBackupContents("backup-1")
+	require.NoError(t, err)
+	defer rc.Close()
+
+	got, err := io.ReadAll(rc)
+	require.NoError(t, err)
+	assert.Equal(t, plaintext, string(got))
+}
+
+func TestGetBackupContentsEncryptionBackwardCompat(t *testing.T) {
+	id, err := age.GenerateX25519Identity()
+	require.NoError(t, err)
+
+	// Write an unencrypted object directly into the store (simulating a backup
+	// created before encryption was enabled).
+	harness := newObjectBackupStoreTestHarnessWithEncryption(
+		"test-bucket", "",
+		[]age.Recipient{id.Recipient()},
+		[]age.Identity{id},
+	)
+	legacyPlaintext := []byte("legacy unencrypted backup contents")
+
+	rawKey := harness.layout.getBackupContentsKey("legacy-backup")
+	require.NoError(t, harness.objectStore.PutObject(harness.bucket, rawKey, bytes.NewReader(legacyPlaintext)))
+
+	// Reading through an encryption-enabled store should pass unencrypted data
+	// through unchanged.
+	rc, err := harness.GetBackupContents("legacy-backup")
+	require.NoError(t, err)
+	defer rc.Close()
+
+	got, err := io.ReadAll(rc)
+	require.NoError(t, err)
+	assert.Equal(t, legacyPlaintext, got)
+}
+
+func TestPutBackupContentsEncryptOnly(t *testing.T) {
+	id, err := age.GenerateX25519Identity()
+	require.NoError(t, err)
+
+	// Public key only — no private key. Simulates high-security mode.
+	harness := newObjectBackupStoreTestHarnessWithEncryption(
+		"test-bucket", "",
+		[]age.Recipient{id.Recipient()},
+		nil, // no identities — can't decrypt
+	)
+	plaintext := "backup contents in encrypt-only mode"
+
+	// Encrypting (Put) should succeed.
+	require.NoError(t, harness.PutBackupContents("backup-1", newStringReadSeeker(plaintext)))
+
+	// The raw stored data should be encrypted.
+	rawKey := harness.layout.getBackupContentsKey("backup-1")
+	rawReader, err := harness.objectStore.GetObject(harness.bucket, rawKey)
+	require.NoError(t, err)
+	rawBytes, err := io.ReadAll(rawReader)
+	require.NoError(t, err)
+	assert.NotEqual(t, []byte(plaintext), rawBytes)
+}
+
+func TestGetBackupContentsDecryptWithoutPrivateKey(t *testing.T) {
+	id, err := age.GenerateX25519Identity()
+	require.NoError(t, err)
+
+	// First, create an encrypted backup using both keys.
+	fullHarness := newObjectBackupStoreTestHarnessWithEncryption(
+		"test-bucket", "",
+		[]age.Recipient{id.Recipient()},
+		[]age.Identity{id},
+	)
+	require.NoError(t, fullHarness.PutBackupContents("backup-1", newStringReadSeeker("secret data")))
+
+	// Now create a harness with only the public key (no private key).
+	readOnlyHarness := newObjectBackupStoreTestHarnessWithEncryption(
+		"test-bucket", "",
+		[]age.Recipient{id.Recipient()},
+		nil,
+	)
+	// Share the same underlying object store.
+	readOnlyHarness.objectStore = fullHarness.objectStore
+	readOnlyHarness.objectBackupStore.objectStore = fullHarness.objectStore
+
+	// Attempting to read the encrypted backup without a private key should fail.
+	rc, err := readOnlyHarness.GetBackupContents("backup-1")
+	if err != nil {
+		assert.Contains(t, err.Error(), "no decryption key")
+		return
+	}
+	defer rc.Close()
+	_, err = io.ReadAll(rc)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no decryption key")
+}
+
+func TestPutBackupEncryptsContents(t *testing.T) {
+	// This tests the actual PutBackup path (not PutBackupContents) to ensure
+	// the contents tarball is encrypted when written via the main backup flow.
+	id, err := age.GenerateX25519Identity()
+	require.NoError(t, err)
+
+	harness := newObjectBackupStoreTestHarnessWithEncryption(
+		"test-bucket", "",
+		[]age.Recipient{id.Recipient()},
+		[]age.Identity{id},
+	)
+
+	contents := "these are the k8s resources including secrets"
+	err = harness.PutBackup(BackupInfo{
+		Name:     "backup-1",
+		Metadata: newStringReadSeeker("metadata"),
+		Contents: newStringReadSeeker(contents),
+		Log:      newStringReadSeeker("log"),
+	})
+	require.NoError(t, err)
+
+	// The raw contents in the object store should be encrypted.
+	rawKey := harness.layout.getBackupContentsKey("backup-1")
+	rawReader, err := harness.objectStore.GetObject(harness.bucket, rawKey)
+	require.NoError(t, err)
+	rawBytes, err := io.ReadAll(rawReader)
+	require.NoError(t, err)
+	assert.NotEqual(t, []byte(contents), rawBytes, "contents should be encrypted in storage")
+	assert.True(t,
+		len(rawBytes) > len(encryptionMagic) && string(rawBytes[:len(encryptionMagic)]) == encryptionMagic,
+		"contents should start with age header",
+	)
+
+	// Metadata should NOT be encrypted (readable without private key).
+	metaKey := harness.layout.getBackupMetadataKey("backup-1")
+	metaReader, err := harness.objectStore.GetObject(harness.bucket, metaKey)
+	require.NoError(t, err)
+	metaBytes, err := io.ReadAll(metaReader)
+	require.NoError(t, err)
+	assert.Equal(t, "metadata", string(metaBytes), "metadata should be stored in plaintext")
+
+	// Reading the contents back through the store should decrypt.
+	rc, err := harness.GetBackupContents("backup-1")
+	require.NoError(t, err)
+	defer rc.Close()
+	got, err := io.ReadAll(rc)
+	require.NoError(t, err)
+	assert.Equal(t, contents, string(got))
+}
+
+func TestPutBackupContentsNoEncryption(t *testing.T) {
+	// Without any encryption config, the store should behave exactly as before.
+	harness := newObjectBackupStoreTestHarness("test-bucket", "")
+	plaintext := "backup contents without encryption"
+
+	require.NoError(t, harness.PutBackupContents("backup-1", newStringReadSeeker(plaintext)))
+
+	rc, err := harness.GetBackupContents("backup-1")
+	require.NoError(t, err)
+	defer rc.Close()
+
+	got, err := io.ReadAll(rc)
+	require.NoError(t, err)
+	assert.Equal(t, plaintext, string(got))
 }

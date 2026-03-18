@@ -3,7 +3,7 @@ apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
   annotations:
-    controller-gen.kubebuilder.io/version: v0.16.5
+    controller-gen.kubebuilder.io/version: v0.20.1
   name: backupstoragelocations.velero.io
 spec:
   group: velero.io
@@ -123,6 +123,60 @@ spec:
                       CACertRef is a reference to a Secret containing the CA certificate bundle to use
                       when verifying TLS connections to the provider. The Secret must be in the same
                       namespace as the BackupStorageLocation.
+                    properties:
+                      key:
+                        description: The key of the secret to select from.  Must be
+                          a valid secret key.
+                        type: string
+                      name:
+                        default: ""
+                        description: |-
+                          Name of the referent.
+                          This field is effectively required, but due to backwards compatibility is
+                          allowed to be empty. Instances of this type with an empty value here are
+                          almost certainly wrong.
+                          More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                        type: string
+                      optional:
+                        description: Specify whether the Secret or its key must be
+                          defined
+                        type: boolean
+                    required:
+                    - key
+                    type: object
+                    x-kubernetes-map-type: atomic
+                  encryptionPrivateKeyRef:
+                    description: |-
+                      EncryptionPrivateKeyRef is a reference to a Secret containing an age X25519
+                      private key (AGE-SECRET-KEY-1...). When set, encrypted objects are decrypted
+                      on read, enabling restores. Requires EncryptionPublicKeyRef to also be set.
+                    properties:
+                      key:
+                        description: The key of the secret to select from.  Must be
+                          a valid secret key.
+                        type: string
+                      name:
+                        default: ""
+                        description: |-
+                          Name of the referent.
+                          This field is effectively required, but due to backwards compatibility is
+                          allowed to be empty. Instances of this type with an empty value here are
+                          almost certainly wrong.
+                          More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                        type: string
+                      optional:
+                        description: Specify whether the Secret or its key must be
+                          defined
+                        type: boolean
+                    required:
+                    - key
+                    type: object
+                    x-kubernetes-map-type: atomic
+                  encryptionPublicKeyRef:
+                    description: |-
+                      EncryptionPublicKeyRef is a reference to a Secret containing an age X25519
+                      public key (age1...). When set, all objects written to object storage are
+                      encrypted before upload using the age encryption format.
                     properties:
                       key:
                         description: The key of the secret to select from.  Must be

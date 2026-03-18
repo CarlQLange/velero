@@ -157,6 +157,18 @@ type ObjectStorageLocation struct {
 	// namespace as the BackupStorageLocation.
 	// +optional
 	CACertRef *corev1api.SecretKeySelector `json:"caCertRef,omitempty"`
+
+	// EncryptionPublicKeyRef is a reference to a Secret containing an age X25519
+	// public key (age1...). When set, all objects written to object storage are
+	// encrypted before upload using the age encryption format.
+	// +optional
+	EncryptionPublicKeyRef *corev1api.SecretKeySelector `json:"encryptionPublicKeyRef,omitempty"`
+
+	// EncryptionPrivateKeyRef is a reference to a Secret containing an age X25519
+	// private key (AGE-SECRET-KEY-1...). When set, encrypted objects are decrypted
+	// on read, enabling restores. Requires EncryptionPublicKeyRef to also be set.
+	// +optional
+	EncryptionPrivateKeyRef *corev1api.SecretKeySelector `json:"encryptionPrivateKeyRef,omitempty"`
 }
 
 // BackupStorageLocationPhase is the lifecycle phase of a Velero BackupStorageLocation.
@@ -187,12 +199,16 @@ const (
 // TODO(2.0): remove the AccessMode field from BackupStorageLocationStatus.
 // TODO(2.0): remove the LastSyncedRevision field from BackupStorageLocationStatus.
 
-// Validate validates the BackupStorageLocation to ensure that only one of CACert or CACertRef is set.
+// Validate validates the BackupStorageLocation configuration.
 func (bsl *BackupStorageLocation) Validate() error {
-	if bsl.Spec.ObjectStorage != nil &&
-		bsl.Spec.ObjectStorage.CACert != nil &&
-		bsl.Spec.ObjectStorage.CACertRef != nil {
+	if bsl.Spec.ObjectStorage == nil {
+		return nil
+	}
+	if bsl.Spec.ObjectStorage.CACert != nil && bsl.Spec.ObjectStorage.CACertRef != nil {
 		return errors.New("cannot specify both caCert and caCertRef in objectStorage")
+	}
+	if bsl.Spec.ObjectStorage.EncryptionPrivateKeyRef != nil && bsl.Spec.ObjectStorage.EncryptionPublicKeyRef == nil {
+		return errors.New("encryptionPrivateKeyRef requires encryptionPublicKeyRef to also be set")
 	}
 	return nil
 }

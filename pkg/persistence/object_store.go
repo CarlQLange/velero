@@ -23,6 +23,7 @@ import (
 	"strings"
 	"time"
 
+	"filippo.io/age"
 	snapshotv1api "github.com/kubernetes-csi/external-snapshotter/client/v8/apis/volumesnapshot/v1"
 
 	"github.com/pkg/errors"
@@ -96,10 +97,12 @@ type BackupStore interface {
 const DownloadURLTTL = 10 * time.Minute
 
 type objectBackupStore struct {
-	objectStore velero.ObjectStore
-	bucket      string
-	layout      *ObjectStoreLayout
-	logger      logrus.FieldLogger
+	objectStore          velero.ObjectStore
+	bucket               string
+	layout               *ObjectStoreLayout
+	logger               logrus.FieldLogger
+	encryptionRecipients []age.Recipient // public keys for encryption on write
+	encryptionIdentities []age.Identity  // private keys for decryption on read
 }
 
 // ObjectStoreGetter is a type that can get a velero.ObjectStore
@@ -195,6 +198,40 @@ func (b *objectBackupStoreGetter) Get(location *velerov1api.BackupStorageLocatio
 		objectStoreConfig["credentialsFile"] = credsFile
 	}
 
+	// Resolve encryption keys if configured.
+	var encryptionRecipients []age.Recipient
+	var encryptionIdentities []age.Identity
+
+	if location.Spec.ObjectStorage.EncryptionPublicKeyRef != nil {
+		if b.secretStore == nil {
+			return nil, errors.New("secret store required for encryptionPublicKeyRef but not available")
+		}
+		pubKeyStr, err := b.secretStore.Get(location.Spec.ObjectStorage.EncryptionPublicKeyRef)
+		if err != nil {
+			return nil, errors.Wrap(err, "error getting encryption public key from secret")
+		}
+		recipient, err := age.ParseX25519Recipient(strings.TrimSpace(pubKeyStr))
+		if err != nil {
+			return nil, errors.Wrap(err, "error parsing age public key")
+		}
+		encryptionRecipients = []age.Recipient{recipient}
+	}
+
+	if location.Spec.ObjectStorage.EncryptionPrivateKeyRef != nil {
+		if b.secretStore == nil {
+			return nil, errors.New("secret store required for encryptionPrivateKeyRef but not available")
+		}
+		privKeyStr, err := b.secretStore.Get(location.Spec.ObjectStorage.EncryptionPrivateKeyRef)
+		if err != nil {
+			return nil, errors.Wrap(err, "error getting encryption private key from secret")
+		}
+		identity, err := age.ParseX25519Identity(strings.TrimSpace(privKeyStr))
+		if err != nil {
+			return nil, errors.Wrap(err, "error parsing age private key")
+		}
+		encryptionIdentities = []age.Identity{identity}
+	}
+
 	objectStore, err := objectStoreGetter.GetObjectStore(location.Spec.Provider)
 	if err != nil {
 		return nil, err
@@ -210,10 +247,12 @@ func (b *objectBackupStoreGetter) Get(location *velerov1api.BackupStorageLocatio
 	}))
 
 	return &objectBackupStore{
-		objectStore: objectStore,
-		bucket:      bucket,
-		layout:      NewObjectStoreLayout(prefix),
-		logger:      log,
+		objectStore:          objectStore,
+		bucket:               bucket,
+		layout:               NewObjectStoreLayout(prefix),
+		logger:               log,
+		encryptionRecipients: encryptionRecipients,
+		encryptionIdentities: encryptionIdentities,
 	}, nil
 }
 
@@ -278,7 +317,7 @@ func (s *objectBackupStore) PutBackup(info BackupInfo) error {
 		return err
 	}
 
-	if err := seekAndPutObject(s.objectStore, s.bucket, s.layout.getBackupContentsKey(info.Name), info.Contents); err != nil {
+	if err := s.encryptingPutObject(s.layout.getBackupContentsKey(info.Name), info.Contents); err != nil {
 		deleteErr := s.objectStore.DeleteObject(s.bucket, s.layout.getBackupMetadataKey(info.Name))
 		return kerrors.NewAggregate([]error{err, deleteErr})
 	}
@@ -556,7 +595,7 @@ func (s *objectBackupStore) GetRestoreResults(name string) (map[string]results.R
 }
 
 func (s *objectBackupStore) GetBackupContents(name string) (io.ReadCloser, error) {
-	return s.objectStore.GetObject(s.bucket, s.layout.getBackupContentsKey(name))
+	return s.decryptingGetObject(s.layout.getBackupContentsKey(name))
 }
 
 func (s *objectBackupStore) BackupExists(bucket, backupName string) (bool, error) {
@@ -626,7 +665,7 @@ func (s *objectBackupStore) PutBackupItemOperations(backup string, backupItemOpe
 }
 
 func (s *objectBackupStore) PutBackupContents(backup string, backupContents io.Reader) error {
-	return seekAndPutObject(s.objectStore, s.bucket, s.layout.getBackupContentsKey(backup), backupContents)
+	return s.encryptingPutObject(s.layout.getBackupContentsKey(backup), backupContents)
 }
 
 func (s *objectBackupStore) GetDownloadURL(target velerov1api.DownloadTarget) (string, error) {
@@ -681,6 +720,52 @@ func (s *objectBackupStore) GetRestoredResourceList(name string) (map[string][]s
 	}
 
 	return list, nil
+}
+
+// encryptingPutObject encrypts the reader if encryption is configured, then writes to the object store.
+func (s *objectBackupStore) encryptingPutObject(key string, file io.Reader) error {
+	if file == nil {
+		return nil
+	}
+
+	if err := seekToBeginning(file); err != nil {
+		return errors.WithStack(err)
+	}
+
+	var src io.Reader = file
+	if len(s.encryptionRecipients) > 0 {
+		er, err := newEncryptingReader(s.encryptionRecipients, file)
+		if err != nil {
+			return errors.Wrap(err, "error setting up encryption")
+		}
+		src = er
+	}
+
+	return s.objectStore.PutObject(s.bucket, key, src)
+}
+
+// decryptingGetObject reads from the object store and decrypts if the data is age-encrypted.
+func (s *objectBackupStore) decryptingGetObject(key string) (io.ReadCloser, error) {
+	rc, err := s.objectStore.GetObject(s.bucket, key)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(s.encryptionRecipients) == 0 && len(s.encryptionIdentities) == 0 {
+		// No encryption configured at all — return as-is.
+		return rc, nil
+	}
+
+	r, err := newDecryptingReader(s.encryptionIdentities, rc)
+	if err != nil {
+		rc.Close()
+		return nil, err
+	}
+
+	return struct {
+		io.Reader
+		io.Closer
+	}{r, rc}, nil
 }
 
 func seekToBeginning(r io.Reader) error {

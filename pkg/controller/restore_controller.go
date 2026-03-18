@@ -279,6 +279,24 @@ func (r *restoreReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		restore.Status.Phase == api.RestorePhasePartiallyFailed ||
 		restore.Status.Phase == api.RestorePhaseCompleted {
 		restore.Status.CompletionTimestamp = &metav1.Time{Time: r.clock.Now()}
+
+		// Clean up the per-restore encryption private key Secret if one was
+		// provided. The key is only needed during restore execution and should
+		// not linger in the cluster.
+		if restore.Spec.EncryptionPrivateKeyRef != nil {
+			encSecret := &corev1api.Secret{}
+			encSecretKey := client.ObjectKey{
+				Namespace: restore.Namespace,
+				Name:      restore.Spec.EncryptionPrivateKeyRef.Name,
+			}
+			if err := r.kbClient.Get(ctx, encSecretKey, encSecret); err == nil {
+				if delErr := r.kbClient.Delete(ctx, encSecret); delErr != nil {
+					log.WithError(delErr).Warn("Failed to delete per-restore encryption key secret")
+				} else {
+					log.WithField("secret", encSecretKey.Name).Info("Deleted per-restore encryption key secret")
+				}
+			}
+		}
 	}
 	log.Debug("Updating restore's status")
 	// Phases were updated in runValidatedRestore
@@ -508,7 +526,19 @@ func (r *restoreReconciler) runValidatedRestore(restore *api.Restore, info backu
 	pluginManager := r.newPluginManager(restoreLog)
 	defer pluginManager.CleanupClients()
 
-	backupStore, err := r.backupStoreGetter.Get(info.location, pluginManager, r.logger)
+	// If the restore specifies an encryption private key, inject it into a copy
+	// of the BSL so the backup store can decrypt. This overrides the BSL's own
+	// encryptionPrivateKeyRef for this restore operation.
+	bslForRestore := info.location
+	if restore.Spec.EncryptionPrivateKeyRef != nil {
+		bslForRestore = info.location.DeepCopy()
+		if bslForRestore.Spec.ObjectStorage == nil {
+			bslForRestore.Spec.ObjectStorage = &api.ObjectStorageLocation{}
+		}
+		bslForRestore.Spec.ObjectStorage.EncryptionPrivateKeyRef = restore.Spec.EncryptionPrivateKeyRef
+	}
+
+	backupStore, err := r.backupStoreGetter.Get(bslForRestore, pluginManager, r.logger)
 	if err != nil {
 		return err
 	}
@@ -626,7 +656,7 @@ func (r *restoreReconciler) runValidatedRestore(restore *api.Restore, info backu
 
 	// re-instantiate the backup store because credentials could have changed since the original
 	// instantiation, if this was a long-running restore
-	backupStore, err = r.backupStoreGetter.Get(info.location, pluginManager, r.logger)
+	backupStore, err = r.backupStoreGetter.Get(bslForRestore, pluginManager, r.logger)
 	if err != nil {
 		return errors.Wrap(err, "error setting up backup store to persist log and results files")
 	}

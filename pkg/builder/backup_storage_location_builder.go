@@ -102,6 +102,24 @@ func (b *BackupStorageLocationBuilder) CACertRef(selector *corev1api.SecretKeySe
 	return b
 }
 
+// EncryptionPublicKeyRef sets the BSL's encryption public key reference.
+func (b *BackupStorageLocationBuilder) EncryptionPublicKeyRef(selector *corev1api.SecretKeySelector) *BackupStorageLocationBuilder {
+	if b.object.Spec.StorageType.ObjectStorage == nil {
+		b.object.Spec.StorageType.ObjectStorage = new(velerov1api.ObjectStorageLocation)
+	}
+	b.object.Spec.ObjectStorage.EncryptionPublicKeyRef = selector
+	return b
+}
+
+// EncryptionPrivateKeyRef sets the BSL's encryption private key reference.
+func (b *BackupStorageLocationBuilder) EncryptionPrivateKeyRef(selector *corev1api.SecretKeySelector) *BackupStorageLocationBuilder {
+	if b.object.Spec.StorageType.ObjectStorage == nil {
+		b.object.Spec.StorageType.ObjectStorage = new(velerov1api.ObjectStorageLocation)
+	}
+	b.object.Spec.ObjectStorage.EncryptionPrivateKeyRef = selector
+	return b
+}
+
 // Default sets the BackupStorageLocation's is default or not
 func (b *BackupStorageLocationBuilder) Default(isDefault bool) *BackupStorageLocationBuilder {
 	b.object.Spec.Default = isDefault

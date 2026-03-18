@@ -105,6 +105,100 @@ func TestBackupStorageLocationValidate(t *testing.T) {
 			},
 			expectError: false,
 		},
+		{
+			name: "valid - only EncryptionPublicKeyRef set (encrypt-only mode)",
+			bsl: &BackupStorageLocation{
+				Spec: BackupStorageLocationSpec{
+					StorageType: StorageType{
+						ObjectStorage: &ObjectStorageLocation{
+							Bucket: "test-bucket",
+							EncryptionPublicKeyRef: &corev1api.SecretKeySelector{
+								LocalObjectReference: corev1api.LocalObjectReference{
+									Name: "velero-encryption-public",
+								},
+								Key: "key",
+							},
+						},
+					},
+				},
+			},
+			expectError: false,
+		},
+		{
+			name: "valid - both encryption refs set (convenience mode)",
+			bsl: &BackupStorageLocation{
+				Spec: BackupStorageLocationSpec{
+					StorageType: StorageType{
+						ObjectStorage: &ObjectStorageLocation{
+							Bucket: "test-bucket",
+							EncryptionPublicKeyRef: &corev1api.SecretKeySelector{
+								LocalObjectReference: corev1api.LocalObjectReference{
+									Name: "velero-encryption-public",
+								},
+								Key: "key",
+							},
+							EncryptionPrivateKeyRef: &corev1api.SecretKeySelector{
+								LocalObjectReference: corev1api.LocalObjectReference{
+									Name: "velero-encryption-private",
+								},
+								Key: "key",
+							},
+						},
+					},
+				},
+			},
+			expectError: false,
+		},
+		{
+			name: "invalid - EncryptionPrivateKeyRef without EncryptionPublicKeyRef",
+			bsl: &BackupStorageLocation{
+				Spec: BackupStorageLocationSpec{
+					StorageType: StorageType{
+						ObjectStorage: &ObjectStorageLocation{
+							Bucket: "test-bucket",
+							EncryptionPrivateKeyRef: &corev1api.SecretKeySelector{
+								LocalObjectReference: corev1api.LocalObjectReference{
+									Name: "velero-encryption-private",
+								},
+								Key: "key",
+							},
+						},
+					},
+				},
+			},
+			expectError: true,
+		},
+		{
+			name: "valid - encryption refs with CACertRef (orthogonal features)",
+			bsl: &BackupStorageLocation{
+				Spec: BackupStorageLocationSpec{
+					StorageType: StorageType{
+						ObjectStorage: &ObjectStorageLocation{
+							Bucket: "test-bucket",
+							CACertRef: &corev1api.SecretKeySelector{
+								LocalObjectReference: corev1api.LocalObjectReference{
+									Name: "ca-cert-secret",
+								},
+								Key: "ca.crt",
+							},
+							EncryptionPublicKeyRef: &corev1api.SecretKeySelector{
+								LocalObjectReference: corev1api.LocalObjectReference{
+									Name: "velero-encryption-public",
+								},
+								Key: "key",
+							},
+							EncryptionPrivateKeyRef: &corev1api.SecretKeySelector{
+								LocalObjectReference: corev1api.LocalObjectReference{
+									Name: "velero-encryption-private",
+								},
+								Key: "key",
+							},
+						},
+					},
+				},
+			},
+			expectError: false,
+		},
 	}
 
 	for _, test := range tests {
